@@ -5,9 +5,9 @@ import time
 import re
 import json
 import requests
+import sys
 from bs4 import BeautifulSoup
 
-import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
@@ -16,6 +16,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", 30))
 
 STATE_FILE = "processed_ids.json"
+LABEL_NAME = "Discord Bot"
 
 
 def load_state():
@@ -151,6 +152,30 @@ def get_email_body(msg):
     return html_body or text_body or ""
 
 
+def is_valid_sale_email(body, subject=""):
+    text = (subject + "\n" + body).lower()
+
+    required = [
+        "stage front consignment",
+        "ticket details",
+        "invoice total",
+        "net amount",
+        "commission",
+    ]
+
+    blocked = [
+        "purchase order",
+        "po created",
+        "forwarding approval",
+        "approval request",
+    ]
+
+    if any(x in text for x in blocked):
+        return False
+
+    return all(x in text for x in required)
+
+
 def parse_email(body):
     soup = BeautifulSoup(body, "html.parser")
     text = soup.get_text("\n")
@@ -284,18 +309,21 @@ def send_to_discord(data):
         "footer": {"text": "StageFront → Discord Pipeline"},
     }
 
-    r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+    r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=20)
     print("Discord status:", r.status_code)
     if r.text:
         print("Discord response:", r.text)
 
 
 def main():
+    print("BOT STARTING...")
+    print("GMAIL_ADDRESS set:", bool(GMAIL_ADDRESS))
+    print("GMAIL_APP_PASSWORD set:", bool(GMAIL_APP_PASSWORD))
+    print("DISCORD_WEBHOOK_URL set:", bool(DISCORD_WEBHOOK_URL))
+    print("POLL_SECONDS:", POLL_SECONDS)
+
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not DISCORD_WEBHOOK_URL:
         print("Missing one or more environment variables.")
-        print("GMAIL_ADDRESS =", bool(GMAIL_ADDRESS))
-        print("GMAIL_APP_PASSWORD =", bool(GMAIL_APP_PASSWORD))
-        print("DISCORD_WEBHOOK_URL =", bool(DISCORD_WEBHOOK_URL))
         return
 
     processed = load_state()
@@ -310,18 +338,18 @@ def main():
             status, mailbox_info = mail.select("inbox")
             print("Select status:", status, mailbox_info)
 
-            status, data = mail.uid("search", None, "UNSEEN")
+            status, data = mail.search(None, f'(UNSEEN X-GM-LABELS "{LABEL_NAME}")')
             print("Search status:", status)
             print("Raw search result:", data)
 
             ids = data[0].split() if data and data[0] else []
-            print("Unread emails found:", len(ids))
+            print("Unread labeled emails found:", len(ids))
 
             for msg_id in ids:
                 decoded_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
                 print("Processing message ID:", decoded_id)
 
-                _, msg_data = mail.uid("fetch", msg_id, "(RFC822)")
+                _, msg_data = mail.fetch(msg_id, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
 
                 subject = msg.get("Subject", "")
@@ -329,27 +357,17 @@ def main():
                 print("Subject:", subject)
                 print("From:", from_addr)
 
-                from_lower = from_addr.lower()
-                subject_lower = subject.lower()
-
-                is_stagefront = (
-                    "stagefront" in from_lower
-                    or "stage front" in from_lower
-                    or "stagefront" in subject_lower
-                    or "stage front" in subject_lower
-                    or "invoice" in subject_lower
-                )
-
-                if not is_stagefront:
-                    print("Not StageFront, skipping")
-                    continue
-
                 if decoded_id in processed:
                     print("Already processed, skipping:", decoded_id)
                     continue
 
                 body = get_email_body(msg)
-                print("Body length:", len(body))
+
+                if not is_valid_sale_email(body, subject):
+                    print("Skipped non-sale email")
+                    processed.add(decoded_id)
+                    save_state(processed)
+                    continue
 
                 parsed = parse_email(body)
                 print("Parsed data:", parsed)
