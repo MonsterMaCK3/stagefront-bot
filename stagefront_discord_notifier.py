@@ -13,8 +13,7 @@ sys.stdout.reconfigure(line_buffering=True)
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", 10))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", 30))
 
 STATE_FILE = "processed_ids.json"
 LABEL_NAME = "Discord Bot"
@@ -257,14 +256,24 @@ def parse_email(body):
     data["account"] = None
     data["email"] = None
 
-    acct_line = re.search(r"([A-Z0-9\-\/]+)\s*\(([^)@\s]+@[^)\s]+)\)", text, re.IGNORECASE)
+    acct_line = re.search(
+        r"([A-Z0-9\-\/]+)\s*\(([^)@\s]+@[^)\s]+)\)",
+        text,
+        re.IGNORECASE,
+    )
     if acct_line:
         data["account"] = acct_line.group(1).strip()
         data["email"] = acct_line.group(2).strip()
-    else:
-        email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", text, re.IGNORECASE)
-        if email_match:
-            data["email"] = email_match.group(1).strip()
+
+    if not data["account"] or not data["email"]:
+        acct_line2 = re.search(
+            r"Account\s*:\s*([A-Z0-9\-\/]+)\s*,\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+            text,
+            re.IGNORECASE,
+        )
+        if acct_line2:
+            data["account"] = acct_line2.group(1).strip()
+            data["email"] = acct_line2.group(2).strip()
 
     if not data["account"]:
         data["account"] = (
@@ -272,6 +281,15 @@ def parse_email(body):
             or table_values.get("account ref")
             or table_values.get("account number")
         )
+
+    if not data["email"]:
+        email_match = re.search(
+            r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
+            text,
+            re.IGNORECASE,
+        )
+        if email_match:
+            data["email"] = email_match.group(1).strip()
 
     transfer = re.search(
         r"(Mobile XFER|Mobile Transfer|PDF|AXS|TM Transfer)",
@@ -366,8 +384,6 @@ def main():
     print("Loaded processed IDs:", len(processed))
 
     while True:
-        sleep_time = POLL_SECONDS
-
         try:
             print("Checking inbox...")
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -413,6 +429,14 @@ def main():
 
                 parsed = parse_email(body)
                 print("Parsed data:", parsed)
+                print("Missing fields check:", {
+                    "invoice": parsed.get("invoice"),
+                    "event": parsed.get("event"),
+                    "email": parsed.get("email"),
+                    "account": parsed.get("account"),
+                    "platform": parsed.get("platform"),
+                    "transfer": parsed.get("transfer"),
+                })
 
                 send_to_discord(parsed)
 
@@ -424,10 +448,9 @@ def main():
 
         except Exception as e:
             print("ERROR:", repr(e))
-            sleep_time = 20
 
-        print(f"Sleeping {sleep_time} seconds...")
-        time.sleep(sleep_time)
+        print(f"Sleeping {POLL_SECONDS} seconds...")
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
