@@ -13,10 +13,12 @@ sys.stdout.reconfigure(line_buffering=True)
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", 30))
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", 10))
 
 STATE_FILE = "processed_ids.json"
 LABEL_NAME = "Discord Bot"
+RECENT_EMAIL_LIMIT = 75
 
 
 def load_state():
@@ -136,10 +138,10 @@ def get_email_body(msg):
 
             decoded = payload.decode(errors="ignore")
 
-            if ctype == "text/html" and not html_body:
-                html_body = decoded
-            elif ctype == "text/plain" and not text_body:
-                text_body = decoded
+            if ctype == "text/html":
+                html_body += decoded
+            elif ctype == "text/plain":
+                text_body += decoded
     else:
         payload = msg.get_payload(decode=True)
         if payload:
@@ -149,19 +151,14 @@ def get_email_body(msg):
             else:
                 text_body = decoded
 
+    if "Stage Front Consignment" in html_body or "Invoice Total" in html_body:
+        return html_body
+
     return html_body or text_body or ""
 
 
 def is_valid_sale_email(body, subject=""):
     text = (subject + "\n" + body).lower()
-
-    required = [
-        "stage front consignment",
-        "ticket details",
-        "invoice total",
-        "net amount",
-        "commission",
-    ]
 
     blocked = [
         "purchase order",
@@ -169,14 +166,19 @@ def is_valid_sale_email(body, subject=""):
         "forwarding approval",
         "approval request",
     ]
-
     if any(x in text for x in blocked):
         return False
 
-    return all(x in text for x in required)
+    has_stagefront = "stage front consignment" in text
+    has_invoice = "invoice #" in text or "invoice" in text
+    has_total = "invoice total" in text
+
+    return has_stagefront and has_invoice and has_total
 
 
 def parse_email(body):
+    body = re.split(r"-{5,}\s*Forwarded message\s*-{5,}", body, flags=re.IGNORECASE)[-1]
+
     soup = BeautifulSoup(body, "html.parser")
     text = soup.get_text("\n")
     text = text.replace("\xa0", " ")
@@ -189,10 +191,33 @@ def parse_email(body):
         m = re.search(pattern, text, re.IGNORECASE)
         return m.group(1).strip() if m else None
 
-    data["invoice"] = find(r"Invoice\s*#\s*(\d+)")
-    data["event"] = find(r"Event:\s*(.*)")
-    data["datetime"] = find(r"Date/Time:\s*(.*)")
-    data["venue"] = find(r"Venue:\s*(.*)")
+    def clean_label(label):
+        return re.sub(r"\s+", " ", label.strip().lower().replace(":", ""))
+
+    def extract_table_values():
+        values = {}
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) >= 2:
+                label = clean_label(cells[0].get_text(" ", strip=True))
+                value = cells[1].get_text(" ", strip=True)
+                if label and value:
+                    values[label] = value
+        return values
+
+    table_values = extract_table_values()
+
+    def table_or_regex(table_key, regex_pattern):
+        return table_values.get(table_key) or find(regex_pattern)
+
+    data["invoice"] = table_or_regex("invoice #", r"Invoice\s*#\s*(\d+)")
+    data["event"] = table_or_regex("event", r"Event:\s*(.*)")
+    data["datetime"] = (
+        table_values.get("date/time")
+        or table_values.get("date / time")
+        or find(r"Date/Time:\s*(.*)")
+    )
+    data["venue"] = table_or_regex("venue", r"Venue:\s*(.*)")
 
     sec = re.search(
         r"Section:\s*(.*?)\s*\|\s*Row:\s*(.*?)\s*\|\s*Qty:\s*(\d+)\s*\|\s*Seats:\s*(.*)",
@@ -205,34 +230,48 @@ def parse_email(body):
         data["qty"] = sec.group(3).strip()
         data["seats"] = sec.group(4).strip()
     else:
-        data["section"] = find(r"Section:\s*(.*)")
-        data["row"] = find(r"Row:\s*(.*)")
-        data["qty"] = find(r"Qty:\s*(\d+)")
-        data["seats"] = find(r"Seats:\s*(.*)")
+        data["section"] = table_or_regex("section", r"Section:\s*(.*)")
+        data["row"] = table_or_regex("row", r"Row:\s*(.*)")
+        data["qty"] = table_or_regex("qty", r"Qty:\s*(\d+)")
+        data["seats"] = table_or_regex("seats", r"Seats:\s*(.*)")
 
-    data["price"] = clean_money(find(r"Price Per:\s*([^\n]+)"))
-    data["total"] = clean_money(find(r"Invoice Total:\s*([^\n]+)"))
-    data["net"] = clean_money(find(r"Net Amount:\s*([^\n]+)"))
-    data["total_cost"] = clean_money(find(r"Total Cost:\s*([^\n]+)"))
+    data["price"] = clean_money(table_or_regex("price per", r"Price Per:\s*([^\n]+)"))
+    data["total"] = clean_money(table_or_regex("invoice total", r"Invoice Total:\s*([^\n]+)"))
+    data["net"] = clean_money(table_or_regex("net amount", r"Net Amount:\s*([^\n]+)"))
+    data["total_cost"] = clean_money(table_or_regex("total cost", r"Total Cost:\s*([^\n]+)"))
 
-    commission_raw = find(r"Commission:\s*([^\n]+)")
+    commission_raw = table_or_regex("commission", r"Commission:\s*([^\n]+)")
     if commission_raw:
-        commission_raw = (
-            commission_raw.replace("−", "-")
-            .replace("–", "-")
-            .replace("—", "-")
-        )
+        commission_raw = commission_raw.replace("−", "-").replace("–", "-").replace("—", "-")
     data["commission"] = clean_money(commission_raw)
 
-    roi_raw = find(r"ROI \$:\s*([^\n]+)")
+    roi_raw = table_or_regex("roi $", r"ROI \$:\s*([^\n]+)")
     data["roi_dollar"] = clean_money(roi_raw)
-    data["roi_percent"] = find(r"ROI %:\s*([\d\.]+)%")
-    data["remaining"] = find(r"Tickets Remaining.*:\s*(\d+)")
+    data["roi_percent"] = table_or_regex("roi %", r"ROI %:\s*([\d\.]+)%")
+    data["remaining"] = (
+        table_values.get("tickets remaining")
+        or table_values.get("tickets remaining for event")
+        or find(r"Tickets Remaining.*:\s*(\d+)")
+    )
 
-    acct = re.search(r"([A-Z0-9\-\/]+)\s*\(([^)]+)\)", text, re.IGNORECASE)
-    if acct:
-        data["account"] = acct.group(1).strip()
-        data["email"] = acct.group(2).strip()
+    data["account"] = None
+    data["email"] = None
+
+    acct_line = re.search(r"([A-Z0-9\-\/]+)\s*\(([^)@\s]+@[^)\s]+)\)", text, re.IGNORECASE)
+    if acct_line:
+        data["account"] = acct_line.group(1).strip()
+        data["email"] = acct_line.group(2).strip()
+    else:
+        email_match = re.search(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", text, re.IGNORECASE)
+        if email_match:
+            data["email"] = email_match.group(1).strip()
+
+    if not data["account"]:
+        data["account"] = (
+            table_values.get("account")
+            or table_values.get("account ref")
+            or table_values.get("account number")
+        )
 
     transfer = re.search(
         r"(Mobile XFER|Mobile Transfer|PDF|AXS|TM Transfer)",
@@ -241,14 +280,18 @@ def parse_email(body):
     )
     if transfer:
         data["transfer"] = transfer.group(1)
+    else:
+        data["transfer"] = table_values.get("transfer type") or table_values.get("transfer")
 
     platform = re.search(
-        r"(TickPick|Ticketmaster|AXS|SeatGeek|StubHub)",
+        r"(TickPick|Ticketmaster|AXS|SeatGeek|StubHub|Vivid Seats)",
         text,
         re.IGNORECASE,
     )
     if platform:
         data["platform"] = platform.group(1)
+    else:
+        data["platform"] = table_values.get("platform")
 
     return data
 
@@ -264,9 +307,7 @@ def send_to_discord(data):
     if data.get("roi_dollar") is not None or data.get("roi_percent") is not None:
         roi_value = f"{format_money(data.get('roi_dollar'))} ({data.get('roi_percent') or '—'}%)"
 
-    description_parts = [
-        f"**Status:** {meta['status']}",
-    ]
+    description_parts = [f"**Status:** {meta['status']}"]
     if meta["tag"]:
         description_parts.append(meta["tag"])
 
@@ -278,7 +319,6 @@ def send_to_discord(data):
             {"name": "Invoice", "value": str(data.get("invoice", "—")), "inline": True},
             {"name": "Venue", "value": str(data.get("venue", "—")), "inline": True},
             {"name": "Date", "value": str(data.get("datetime", "—")), "inline": True},
-
             {
                 "name": "Section / Row",
                 "value": f"{data.get('section', '—')} / {data.get('row', '—')}",
@@ -290,19 +330,15 @@ def send_to_discord(data):
                 "inline": True,
             },
             {"name": "Platform", "value": str(data.get("platform", "—")), "inline": True},
-
             {"name": "Price Per", "value": format_money(data.get("price")), "inline": True},
             {"name": "Total Cost", "value": format_money(data.get("total_cost")), "inline": True},
             {"name": "Invoice Total", "value": format_money(data.get("total")), "inline": True},
-
             {"name": "Commission", "value": format_signed_bold(data.get("commission")), "inline": True},
             {"name": "Net Amount", "value": format_signed_bold(data.get("net")), "inline": True},
             {"name": "Profit", "value": format_profit(profit), "inline": True},
-
             {"name": "ROI", "value": f"📊 **{roi_value}**" if roi_value != "—" else "—", "inline": True},
             {"name": "Remaining Tickets", "value": str(data.get("remaining", "—")), "inline": True},
             {"name": "Transfer Type", "value": str(data.get("transfer", "—")), "inline": True},
-
             {"name": "Account", "value": str(data.get("account", "—")), "inline": False},
             {"name": "Buyer Email", "value": str(data.get("email", "—")), "inline": False},
         ],
@@ -330,6 +366,8 @@ def main():
     print("Loaded processed IDs:", len(processed))
 
     while True:
+        sleep_time = POLL_SECONDS
+
         try:
             print("Checking inbox...")
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -338,16 +376,23 @@ def main():
             status, mailbox_info = mail.select("inbox")
             print("Select status:", status, mailbox_info)
 
-            status, data = mail.search(None, f'(UNSEEN X-GM-LABELS "{LABEL_NAME}")')
+            status, data = mail.search(None, f'(X-GM-LABELS "{LABEL_NAME}")')
             print("Search status:", status)
             print("Raw search result:", data)
 
             ids = data[0].split() if data and data[0] else []
-            print("Unread labeled emails found:", len(ids))
+            print("Labeled emails found:", len(ids))
+
+            ids = ids[-RECENT_EMAIL_LIMIT:]
+            print("Checking most recent labeled emails:", len(ids))
 
             for msg_id in ids:
                 decoded_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
                 print("Processing message ID:", decoded_id)
+
+                if decoded_id in processed:
+                    print("Already processed, skipping:", decoded_id)
+                    continue
 
                 _, msg_data = mail.fetch(msg_id, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
@@ -357,14 +402,11 @@ def main():
                 print("Subject:", subject)
                 print("From:", from_addr)
 
-                if decoded_id in processed:
-                    print("Already processed, skipping:", decoded_id)
-                    continue
-
                 body = get_email_body(msg)
 
                 if not is_valid_sale_email(body, subject):
-                    print("Skipped non-sale email")
+                    print("Skipped email - failed validation")
+                    print("Preview:", body[:500])
                     processed.add(decoded_id)
                     save_state(processed)
                     continue
@@ -382,9 +424,10 @@ def main():
 
         except Exception as e:
             print("ERROR:", repr(e))
+            sleep_time = 20
 
-        print(f"Sleeping {POLL_SECONDS} seconds...")
-        time.sleep(POLL_SECONDS)
+        print(f"Sleeping {sleep_time} seconds...")
+        time.sleep(sleep_time)
 
 
 if __name__ == "__main__":
