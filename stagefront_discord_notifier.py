@@ -15,7 +15,7 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", 30))
 
-STATE_FILE = "processed_ids.json"
+STATE_FILE = "processed_ids_v2.json"
 LABEL_NAME = "Discord Bot"
 RECENT_EMAIL_LIMIT = 75
 
@@ -165,14 +165,24 @@ def is_valid_sale_email(body, subject=""):
         "forwarding approval",
         "approval request",
     ]
+
     if any(x in text for x in blocked):
         return False
 
-    has_stagefront = "stage front consignment" in text
-    has_invoice = "invoice #" in text or "invoice" in text
-    has_total = "invoice total" in text
+    has_sale_subject = "your tickets have sold" in subject.lower()
 
-    return has_stagefront and has_invoice and has_total
+    has_invoice_total = "invoice total" in text
+    has_net_amount = "net amount" in text
+    has_ticket_details = "ticket details" in text
+    has_invoice_number = "invoice #" in text or re.search(r"#\d{6,}", text) is not None
+
+    if has_sale_subject and has_invoice_total and has_net_amount:
+        return True
+
+    if has_ticket_details and has_invoice_total and has_net_amount and has_invoice_number:
+        return True
+
+    return False
 
 
 def parse_email(body):
@@ -219,7 +229,7 @@ def parse_email(body):
     data["venue"] = table_or_regex("venue", r"Venue:\s*(.*)")
 
     sec = re.search(
-        r"Section:\s*(.*?)\s*\|\s*Row:\s*(.*?)\s*\|\s*Qty:\s*(\d+)\s*\|\s*Seats:\s*(.*)",
+        r"Section:\s*(.*?)\s*\|\s*Row:\s*(.*?)\s*\|\s*Qty:\s*(\d+)\s*\|\s*Seats:\s*([^\n]+(?:\n[^\n]+)?)",
         text,
         re.IGNORECASE,
     )
@@ -227,7 +237,7 @@ def parse_email(body):
         data["section"] = sec.group(1).strip()
         data["row"] = sec.group(2).strip()
         data["qty"] = sec.group(3).strip()
-        data["seats"] = sec.group(4).strip()
+        data["seats"] = re.sub(r"\s+", " ", sec.group(4)).strip()
     else:
         data["section"] = table_or_regex("section", r"Section:\s*(.*)")
         data["row"] = table_or_regex("row", r"Row:\s*(.*)")
@@ -368,6 +378,8 @@ def send_to_discord(data):
     if r.text:
         print("Discord response:", r.text)
 
+    return r.status_code in (200, 204)
+
 
 def main():
     print("BOT STARTING...")
@@ -422,9 +434,8 @@ def main():
 
                 if not is_valid_sale_email(body, subject):
                     print("Skipped email - failed validation")
+                    print("Subject:", subject)
                     print("Preview:", body[:500])
-                    processed.add(decoded_id)
-                    save_state(processed)
                     continue
 
                 parsed = parse_email(body)
@@ -438,11 +449,14 @@ def main():
                     "transfer": parsed.get("transfer"),
                 })
 
-                send_to_discord(parsed)
+                success = send_to_discord(parsed)
 
-                processed.add(decoded_id)
-                save_state(processed)
-                print("Saved processed ID:", decoded_id)
+                if success:
+                    processed.add(decoded_id)
+                    save_state(processed)
+                    print("Saved processed ID:", decoded_id)
+                else:
+                    print("Discord send failed; not marking processed")
 
             mail.logout()
 
