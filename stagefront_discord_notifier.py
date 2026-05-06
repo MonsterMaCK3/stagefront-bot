@@ -233,6 +233,7 @@ def parse_email(body):
         text,
         re.IGNORECASE,
     )
+
     if sec:
         data["section"] = sec.group(1).strip()
         data["row"] = sec.group(2).strip()
@@ -271,6 +272,7 @@ def parse_email(body):
         text,
         re.IGNORECASE,
     )
+
     if acct_line:
         data["account"] = acct_line.group(1).strip()
         data["email"] = acct_line.group(2).strip()
@@ -281,6 +283,7 @@ def parse_email(body):
             text,
             re.IGNORECASE,
         )
+
         if acct_line2:
             data["account"] = acct_line2.group(1).strip()
             data["email"] = acct_line2.group(2).strip()
@@ -298,6 +301,7 @@ def parse_email(body):
             text,
             re.IGNORECASE,
         )
+
         if email_match:
             data["email"] = email_match.group(1).strip()
 
@@ -306,6 +310,7 @@ def parse_email(body):
         text,
         re.IGNORECASE,
     )
+
     if transfer:
         data["transfer"] = transfer.group(1)
     else:
@@ -316,6 +321,7 @@ def parse_email(body):
         text,
         re.IGNORECASE,
     )
+
     if platform:
         data["platform"] = platform.group(1)
     else:
@@ -326,16 +332,19 @@ def parse_email(body):
 
 def send_to_discord(data):
     profit = None
+
     if data.get("net") is not None and data.get("total_cost") is not None:
         profit = data["net"] - data["total_cost"]
 
     meta = get_profit_meta(profit)
 
     roi_value = "—"
+
     if data.get("roi_dollar") is not None or data.get("roi_percent") is not None:
         roi_value = f"{format_money(data.get('roi_dollar'))} ({data.get('roi_percent') or '—'}%)"
 
     description_parts = [f"**Status:** {meta['status']}"]
+
     if meta["tag"]:
         description_parts.append(meta["tag"])
 
@@ -374,7 +383,9 @@ def send_to_discord(data):
     }
 
     r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=20)
+
     print("Discord status:", r.status_code)
+
     if r.text:
         print("Discord response:", r.text)
 
@@ -398,24 +409,27 @@ def main():
     while True:
         try:
             print("Checking inbox...")
+
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
             mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
 
             status, mailbox_info = mail.select("inbox")
             print("Select status:", status, mailbox_info)
 
-            status, data = mail.search(None, f'(X-GM-LABELS "{LABEL_NAME}")')
+            status, data = mail.search(None, f'(UNSEEN X-GM-LABELS "{LABEL_NAME}")')
+
             print("Search status:", status)
             print("Raw search result:", data)
 
             ids = data[0].split() if data and data[0] else []
-            print("Labeled emails found:", len(ids))
+
+            print("Unread labeled emails found:", len(ids))
 
             ids = ids[-RECENT_EMAIL_LIMIT:]
-            print("Checking most recent labeled emails:", len(ids))
 
             for msg_id in ids:
                 decoded_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+
                 print("Processing message ID:", decoded_id)
 
                 if decoded_id in processed:
@@ -427,6 +441,7 @@ def main():
 
                 subject = msg.get("Subject", "")
                 from_addr = msg.get("From", "")
+
                 print("Subject:", subject)
                 print("From:", from_addr)
 
@@ -439,22 +454,19 @@ def main():
                     continue
 
                 parsed = parse_email(body)
+
                 print("Parsed data:", parsed)
-                print("Missing fields check:", {
-                    "invoice": parsed.get("invoice"),
-                    "event": parsed.get("event"),
-                    "email": parsed.get("email"),
-                    "account": parsed.get("account"),
-                    "platform": parsed.get("platform"),
-                    "transfer": parsed.get("transfer"),
-                })
 
                 success = send_to_discord(parsed)
 
                 if success:
+                    mail.store(msg_id, "+FLAGS", "\\Seen")
+
                     processed.add(decoded_id)
                     save_state(processed)
-                    print("Saved processed ID:", decoded_id)
+
+                    print("Sent alert and marked email as read:", decoded_id)
+
                 else:
                     print("Discord send failed; not marking processed")
 
