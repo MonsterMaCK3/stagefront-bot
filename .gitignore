@@ -1,0 +1,18 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python / env
+__pycache__/
+*.pyc
+.venv/
+
+# Node (if applicable)
+node_modules/
+
+# Claude tool cache
+.claude/
+.claude.json
+
+# Secrets
+.env

@@ -397,86 +397,67 @@ def main():
     print("GMAIL_ADDRESS set:", bool(GMAIL_ADDRESS))
     print("GMAIL_APP_PASSWORD set:", bool(GMAIL_APP_PASSWORD))
     print("DISCORD_WEBHOOK_URL set:", bool(DISCORD_WEBHOOK_URL))
-    print("POLL_SECONDS:", POLL_SECONDS)
 
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not DISCORD_WEBHOOK_URL:
         print("Missing one or more environment variables.")
         return
 
-    processed = load_state()
-    print("Loaded processed IDs:", len(processed))
+    try:
+        print("Checking inbox...")
 
-    while True:
-        try:
-            print("Checking inbox...")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
 
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        status, mailbox_info = mail.select("inbox")
+        print("Select status:", status, mailbox_info)
 
-            status, mailbox_info = mail.select("inbox")
-            print("Select status:", status, mailbox_info)
+        status, data = mail.search(
+            None,
+            f'(UNSEEN X-GM-LABELS "{LABEL_NAME}")'
+        )
 
-            status, data = mail.search(None, f'(UNSEEN X-GM-LABELS "{LABEL_NAME}")')
+        print("Search status:", status)
+        print("Raw search result:", data)
 
-            print("Search status:", status)
-            print("Raw search result:", data)
+        ids = data[0].split() if data and data[0] else []
 
-            ids = data[0].split() if data and data[0] else []
+        print("Unread labeled emails found:", len(ids))
 
-            print("Unread labeled emails found:", len(ids))
+        ids = ids[-RECENT_EMAIL_LIMIT:]
 
-            ids = ids[-RECENT_EMAIL_LIMIT:]
+        for msg_id in ids:
 
-            for msg_id in ids:
-                decoded_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+            _, msg_data = mail.fetch(msg_id, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
 
-                print("Processing message ID:", decoded_id)
+            subject = msg.get("Subject", "")
+            from_addr = msg.get("From", "")
 
-                if decoded_id in processed:
-                    print("Already processed, skipping:", decoded_id)
-                    continue
+            print("Subject:", subject)
+            print("From:", from_addr)
 
-                _, msg_data = mail.fetch(msg_id, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
+            body = get_email_body(msg)
 
-                subject = msg.get("Subject", "")
-                from_addr = msg.get("From", "")
+            if not is_valid_sale_email(body, subject):
+                print("Skipped email - failed validation")
+                continue
 
-                print("Subject:", subject)
-                print("From:", from_addr)
+            parsed = parse_email(body)
 
-                body = get_email_body(msg)
+            print("Parsed data:", parsed)
 
-                if not is_valid_sale_email(body, subject):
-                    print("Skipped email - failed validation")
-                    print("Subject:", subject)
-                    print("Preview:", body[:500])
-                    continue
+            success = send_to_discord(parsed)
 
-                parsed = parse_email(body)
+            if success:
+                mail.store(msg_id, "+FLAGS", "\\Seen")
+                print("Sent alert and marked email as read")
+            else:
+                print("Discord send failed")
 
-                print("Parsed data:", parsed)
+        mail.logout()
 
-                success = send_to_discord(parsed)
-
-                if success:
-                    mail.store(msg_id, "+FLAGS", "\\Seen")
-
-                    processed.add(decoded_id)
-                    save_state(processed)
-
-                    print("Sent alert and marked email as read:", decoded_id)
-
-                else:
-                    print("Discord send failed; not marking processed")
-
-            mail.logout()
-
-        except Exception as e:
-            print("ERROR:", repr(e))
-
-        print(f"Sleeping {POLL_SECONDS} seconds...")
-        time.sleep(POLL_SECONDS)
+    except Exception as e:
+        print("ERROR:", repr(e))
 
 
 if __name__ == "__main__":
